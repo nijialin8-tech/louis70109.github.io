@@ -15,21 +15,61 @@ date: 2026-04-05 20:30:00 +0800
 
 # 前言
 
-在部署 **OpenClaw** 並整合 Ollama Cloud 或第三方轉接層（如 LiteLLM）時，設定檔的精準度直接影響了服務的穩定性。本篇文章彙整了從 2026.3.1 到 2026.4.2 升級過程中的核心問題及其技術對策，提供給需要進行相關架設或升級的開發者參考。
+最近把身邊幾台 OpenClaw 從穩定（但已經快變遺產？）的 2026.3.1 升級到 2026.4.2。本來以為是個 `pnpm install` 就能解決的小事，沒想到這中間的配置變更跟環境限制，還是讓我小坐了一下牢。寫這篇主要就是想把這些踩坑經驗留下來，給之後也要升級的大家一個參考。
+
+或是說，先把信用卡準備好就好(?)。
 
 <!-- more -->
 
 ---
 
-# 1. Agent 權限層級配置
+# 為什麼要升級？（背景）
 
-在 `openclaw.json` 中，全局工具權限（`tools.profile`）並不完全等同於個別 Agent 的權限。為確保工具可用，必須在 Agent 配置層級進行確認。
+其實 3.1 真的跑得挺穩的，但隨著 OpenClaw 支援的雲端模型（尤其是 Ollama Cloud）跟新的 Provider 機制出現，如果想用上最新的 Gemini 3 Flash 或更強大的推理功能，4.2 是必須要跨過去的一個門檻。
 
-### 問題描述
-全局以開啟 `full` 模式，但在 Discord 或特定環境調用時回報 `Tool not found`。
+不過在升級的過程中，我發現了不少關於記憶體控制跟 API 命名的有趣（或是說煩人）變動。像是遇到 SIGKILL 或是模型突然找不到的情況，這時候只要深呼吸、坐牢坐久一點就覺得還行了～
 
-### 技術解決方案
-在 `agents.list` 下的特定 Agent 區塊中，需使用 `alsoAllow` 明確列出需要的敏感權限（如：`exec`、`read`、`image`、`web_search`）。
+---
+
+# 1. 那些被 SIGKILL 帶走的靈魂 (OOM 排除)
+
+升級到 4.2 時，如果你是跑在像 Raspberry Pi、4GB 的小 VPS 或 Docker 容器內，可能常會遇到進度條跑一半就 `SIGKILL` 的狀況。
+
+這不是靈異現象，單純是**記憶體（OOM）**在求救。升級過程中 Git 深度下載（尤其是下載大型相依套件或 Memory 索引建檔）會造成記憶體瞬間噴高。
+
+### 碎碎念
+如果你發現你的 Agent 跑一跑就突然消失，通常是系統看它不爽把它砍了。
+**解法：**
+- **增加 Swap**：真的，給它 4G 的 Swap 空間，它會活得比較久。
+- **限制 Node.js 記憶體**：執行時可以帶上 `--max-old-space-size=2048`，別讓它吃太飽。
+- **Git 優化**：如果是因為 Repo 太大，可以用 `--depth 1` 來克隆。
+
+---
+
+# 2. Ollama Cloud 的變身：不再只是 `:cloud`
+
+在 4.2 之後，模型命名規則做了一個重大的「回歸標準」。原本我們習慣在模型 ID 後面加上 `:cloud`，但現在統一改用 **`:latest`** 了。
+
+### 為什麼要改？
+對開發者來說這其實更直覺。我們本來就習慣 `tag:latest` 代表最新最穩的版本。而且在 4.2 裡，Provider 已經拆分成 `ollama-cloud` 了，所以 ID 裡面就不需要再多強調一次它是雲端模型。
+
+**配置範例：**
+```json
+"ollama-cloud": {
+  "id": "gemini-3-flash-preview:latest",
+  "api": "openai-compatible"
+}
+```
+*就把後綴改成 `:latest` 就好，超簡單對吧(?)。*
+
+---
+
+# 3. Agent 權限配置 (alsoAllow)
+
+在 `openclaw.json` 設定裡，就算你全局開了 `full` 模式，如果具體的 Agent 沒在 `alsoAllow` 裡明確列出權限，它還是會跟你說 `Tool not found`。
+
+### 碎碎念
+這就像你跟老闆說你可以全權負責，但進機房時警衛還是要看你的識別證一樣煩人。
 
 ```json
 "list": [
@@ -44,106 +84,41 @@ date: 2026-04-05 20:30:00 +0800
 
 ---
 
-# 2. 第三方端點的 API 模式適配
+# 4. Discord 的各種小門檻
 
-使用非原生的 `/v1` 兼容介面時，API 的 schema 處理機制是連線成功的關鍵。
-
-### 問題描述
-使用 Ollama Cloud 或代理轉接層時，回報 HTTP 404 Model Not Found 或驗證失敗。
-
-### 技術解決方案
-1. **Endpoint 確認**：確保 `baseUrl` 正確（例如 `https://ollama.com/v1`），無重複斜線。
-2. **API 模式轉換**：必須將 `api` 欄位由預設改為 **`openai-compatible`**。
-
-```json
-"ollama": {
-  "baseUrl": "https://ollama.com/v1",
-  "api": "openai-compatible"
-}
-```
+如果你是用 Discord 當 Gateway 的話，記得這兩件事：
+1. **Mention 規則**：如果 `requireMention` 設為 `true`，你不標註它，它就裝死給你看。
+2. **權限回傳**：Bot 記得要給「嵌入連結」跟「上傳檔案」的權限，不然它就算找到了正妹（誤）或圖表也傳不出來。
 
 ---
 
-# 3. Discord Gateway 與頻道特定設定
+# 5. 解決 Thought Signature 錯誤
 
-針對 Discord 平台的部署，必須注意頻道規則與觸發機制，否則 Agent 會出現「已連線但無反應」的現象。
-
-### 技術細節
-1. **提到 (Mention) 規則**：在群組頻道中，若 `requireMention` 設為 `true`，Agent 僅在被標註時才會回應。
-2. **Guild 選項配置**：
-   ```json
-   "guilds": {
-     "YOUR_GUILD_ID": {
-       "requireMention": true,
-       "channels": {
-         "ALLOWED_CHANNEL_ID": { "allow": true }
-       }
-     }
-   }
-   ```
-3. **權限回傳**：確保 Discord Bot 在該伺服器擁有足夠的「嵌入連結」與「上傳檔案」權限，否則分析結果（如看圖或搜尋網址）將無法正確顯示。
+Gemini 3 Flash 在某些舊版本（如 2026.3.2）會跟傳輸協定打架。
+**解法：**
+1. 將 `reasoning` 設為 `false`。
+2. 或是乖乖升級到 4.2。
 
 ---
 
-# 4. 解決 Thought Signature 錯誤 (重要)
+# 🚀 2026.4.2 建議配置配方
 
-在 2026.3.2 至 2026.3.7 之間的版本中，Gemini 3 Flash 在執行 `function_calling` 時會觸發傳輸協定衝突。
-
-### 解決方案
-1. **關閉推理開關**：模型列表中將 `reasoning` 設為 `false`。
-2. **版本回退**：強烈建議使用 **2026.3.1** 穩定版本（若尚未準備好升級 4.2）。
-
----
-
-# 5. 版本降級 (2026.3.1) 安裝指令
-
-```bash
-openclaw gateway stop
-pnpm add -g openclaw@2026.3.1
-openclaw gateway start
-```
-
----
-
-# 6. 模型 ID 字尾的精確匹配 (:cloud)
-
-使用 Ollama Cloud 時，確保 `openclaw.json` 中的 `id` 與 `primary` 設定完整包含 **`:cloud`** 字尾（註：此規則在 4.2 之後有變動，詳見下方升級章節）。
-
----
-
-# 🚀 升級章節：OpenClaw 4.2 升級與 Ollama 配置修正 (2026-04-05)
-
-當我們將環境從 `2026.3.1` 升級至 `2026.4.2` 時，發現了模型提供商命名與 ID 引用上的重大變動，以下是本次升級的核心修正內容。
-
-### 1. 提供商名稱統一 (Provider Name)
-在 4.2 版本中，為了將雲端 Ollama 與本地實例明確切分，我們將 Ollama Cloud 的訪問權限統一歸類在 `ollama-cloud` 提供商 ID 下。
-- **變動**：將原本混合的 `ollama` 配置拆分，確保雲端調用路徑清晰。
-
-### 2. 模型 ID 更新 (Model IDs)
-升級後發現原本帶有 `:cloud` 字尾的模型 ID（例如 `gemini-3-flash-preview:cloud`）在新的雲端部署命名規則下失效。
-- **修正**：將模型 ID 從 `gemini-3-flash-preview:cloud` 更新為 `gemini-3-flash-preview:latest`。
-- **預設配置更新**：同步更新 `openclaw.json` 中的 `defaults.model.primary` 以及各個 Agent 的 `model` 設定為主機路徑 `ollama-cloud/gemini-3-flash-preview:latest`。
-
-### 3. 配置清理與環境優化
-為了避免對於沒有運行本地 Ollama 實例的機器造成誤導，我們在 `models.json` 中移出了指向 `127.0.0.1` 的本地 Ollama 配置。
-- **驗證**：此修正已在 `writer-assistant` 與 `openclaw-config` 倉庫中驗證通過。
-
----
-
-# 🍪 2026.4.2 建議配置配方
-
-目前最穩定的升級路徑建議：
+目前實測最香的配置組合：
 
 - **版本**：`2026.4.2`
-- **提供商**：使用 `ollama-cloud`
-- **模型**：`gemini-3-flash-preview:latest`
-- **API 模式**：維持 `openai-compatible`
-- **推理功能**：建議暫時設為 `Reasoning: false` 以確保 Function Calling 穩定性。
+- **提供商 (Provider)**：使用 `ollama-cloud`
+- **模型 (Model)**：`gemini-3-flash-preview:latest`
+- **API 模式**：一定要用 `openai-compatible`
+- **推理 (Reasoning)**：建議先關掉，穩定第一！
 
 ---
 
-# 結語：持續優化的 OpenClaw 體驗
+# 結語：繼續折騰吧！
 
-不論是維持在穩定的 3.1 版本，還是邁向具備更多新功能的 4.2，正確的配置都是發揮 AI 助手最大效能的關鍵。
+不管是留在穩定的 3.1 還是衝刺 4.2，找到適合自己的配置才是最重要的。希望這篇筆記能幫大家少走一點彎路，早點享受 AI 的便利。
+
+如果有問題歡迎在 Discord 頻道討論，我們 2026 年見（？）
+
+溫馨提醒：升級前記得備份設定檔，不然坐牢時間會加倍喔 ❤️
 
 整合紀錄於 2026-04-05 By 筆耕餅乾 (Writer Assistant)
